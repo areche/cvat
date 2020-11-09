@@ -1,18 +1,19 @@
-FROM ubuntu:16.04
+FROM ubuntu:20.04
 
 ARG http_proxy
 ARG https_proxy
 ARG no_proxy
 ARG socks_proxy
+ARG TZ
 
 ENV TERM=xterm \
     http_proxy=${http_proxy}   \
     https_proxy=${https_proxy} \
     no_proxy=${no_proxy} \
-    socks_proxy=${socks_proxy}
-
-ENV LANG='C.UTF-8'  \
-    LC_ALL='C.UTF-8'
+    socks_proxy=${socks_proxy} \
+    LANG='C.UTF-8'  \
+    LC_ALL='C.UTF-8' \
+    TZ=${TZ}
 
 ARG USER
 ARG DJANGO_CONFIGURATION
@@ -20,106 +21,79 @@ ENV DJANGO_CONFIGURATION=${DJANGO_CONFIGURATION}
 
 # Install necessary apt packages
 RUN apt-get update && \
-    apt-get install -yq \
-        python-software-properties \
-        software-properties-common \
-        wget && \
-    add-apt-repository ppa:mc3man/xerus-media -y && \
-    add-apt-repository ppa:mc3man/gstffmpeg-keep -y && \
+    apt-get --no-install-recommends install -yq \
+        software-properties-common && \
     apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -yq \
+    DEBIAN_FRONTEND=noninteractive apt-get --no-install-recommends install -yq \
         apache2 \
         apache2-dev \
+        apt-utils \
+        build-essential \
         libapache2-mod-xsendfile \
         supervisor \
-        ffmpeg \
-        gstreamer0.10-ffmpeg \
+        libavcodec-dev=7:4.2.4-1ubuntu0.1 \
+        libavdevice-dev=7:4.2.4-1ubuntu0.1 \
+        libavfilter-dev=7:4.2.4-1ubuntu0.1 \
+        libavformat-dev=7:4.2.4-1ubuntu0.1 \
+        libavutil-dev=7:4.2.4-1ubuntu0.1 \
+        libswresample-dev=7:4.2.4-1ubuntu0.1 \
+        libswscale-dev=7:4.2.4-1ubuntu0.1 \
         libldap2-dev \
         libsasl2-dev \
+        pkg-config \
         python3-dev \
         python3-pip \
-        unzip \
-        unrar \
+        tzdata \
         p7zip-full \
-        vim && \
-    add-apt-repository --remove ppa:mc3man/gstffmpeg-keep -y && \
-    add-apt-repository --remove ppa:mc3man/xerus-media -y && \
-    rm -rf /var/lib/apt/lists/*
+        git \
+        git-lfs \
+        ssh \
+        poppler-utils \
+        curl && \
+    python3 -m pip install --no-cache-dir -U pip==20.0.1 setuptools==49.6.0 wheel==0.35.1 && \
+    ln -fs /usr/share/zoneinfo/${TZ} /etc/localtime && \
+    dpkg-reconfigure -f noninteractive tzdata && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo 'application/wasm wasm' >> /etc/mime.types
 
 # Add a non-root user
 ENV USER=${USER}
 ENV HOME /home/${USER}
 WORKDIR ${HOME}
-RUN adduser --shell /bin/bash --disabled-password --gecos "" ${USER}
+RUN adduser --shell /bin/bash --disabled-password --gecos "" ${USER} && \
+    if [ -z ${socks_proxy} ]; then \
+        echo export "GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30\"" >> ${HOME}/.bashrc; \
+    else \
+        echo export "GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ProxyCommand='nc -X 5 -x ${socks_proxy} %h %p'\"" >> ${HOME}/.bashrc; \
+    fi
 
 COPY components /tmp/components
-
-# OpenVINO toolkit support
-ARG OPENVINO_TOOLKIT
-ENV OPENVINO_TOOLKIT=${OPENVINO_TOOLKIT}
-RUN if [ "$OPENVINO_TOOLKIT" = "yes" ]; then \
-        /tmp/components/openvino/install.sh; \
-    fi
-
-# CUDA support
-ARG CUDA_SUPPORT
-ENV CUDA_SUPPORT=${CUDA_SUPPORT}
-RUN if [ "$CUDA_SUPPORT" = "yes" ]; then \
-        /tmp/components/cuda/install.sh; \
-    fi
-
-# Tensorflow annotation support
-ARG TF_ANNOTATION
-ENV TF_ANNOTATION=${TF_ANNOTATION}
-ENV TF_ANNOTATION_MODEL_PATH=${HOME}/rcnn/inference_graph
-RUN if [ "$TF_ANNOTATION" = "yes" ]; then \
-        bash -i /tmp/components/tf_annotation/install.sh; \
-    fi
-
-ARG WITH_TESTS
-RUN if [ "$WITH_TESTS" = "yes" ]; then \
-        wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - && \
-        echo 'deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main' | tee /etc/apt/sources.list.d/google-chrome.list && \
-        wget -qO- https://deb.nodesource.com/setup_9.x | bash - && \
-        apt-get update && \
-        DEBIAN_FRONTEND=noninteractive apt-get install -yq \
-            google-chrome-stable \
-            nodejs && \
-        rm -rf /var/lib/apt/lists/*; \
-        mkdir tests && cd tests && npm install \
-            eslint \
-            eslint-detailed-reporter \
-            karma \
-            karma-chrome-launcher \
-            karma-coveralls \
-            karma-coverage \
-            karma-junit-reporter \
-            karma-qunit \
-            qunit; \
-        echo "export PATH=~/tests/node_modules/.bin:${PATH}" >> ~/.bashrc; \
-    fi
 
 # Install and initialize CVAT, copy all necessary files
 COPY cvat/requirements/ /tmp/requirements/
 COPY supervisord.conf mod_wsgi.conf wait-for-it.sh manage.py ${HOME}/
-RUN  pip3 install --no-cache-dir -r /tmp/requirements/${DJANGO_CONFIGURATION}.txt
-COPY cvat/ ${HOME}/cvat
+RUN python3 -m pip install --no-cache-dir -r /tmp/requirements/${DJANGO_CONFIGURATION}.txt
 
-COPY ssh ${HOME}/.ssh
-
-# Install git application dependencies
-RUN apt-get update && \
-    apt-get install -y ssh netcat-openbsd git curl zip  && \
-    curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | bash && \
-    apt-get install -y git-lfs && \
-    git lfs install && \
-    rm -rf /var/lib/apt/lists/* && \
-    if [ -n ${socks_proxy} ]; then \
-        echo export "GIT_SSH_COMMAND=\"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -o ProxyCommand='nc -X 5 -x ${socks_proxy} %h %p'\"" >> ${HOME}/.bashrc; \
+ARG CLAM_AV
+ENV CLAM_AV=${CLAM_AV}
+RUN if [ "$CLAM_AV" = "yes" ]; then \
+        apt-get update && \
+        apt-get --no-install-recommends install -yq \
+            clamav \
+            libclamunrar9 && \
+        sed -i 's/ReceiveTimeout 30/ReceiveTimeout 300/g' /etc/clamav/freshclam.conf && \
+        freshclam && \
+        chown -R ${USER}:${USER} /var/lib/clamav && \
+        rm -rf /var/lib/apt/lists/*; \
     fi
 
+COPY ssh ${HOME}/.ssh
+COPY utils ${HOME}/utils
+COPY cvat/ ${HOME}/cvat
+COPY cvat-core/ ${HOME}/cvat-core
+COPY cvat-data/ ${HOME}/cvat-data
 COPY tests ${HOME}/tests
-RUN patch -p1 < ${HOME}/cvat/apps/engine/static/engine/js/3rdparty.patch
+
 RUN chown -R ${USER}:${USER} .
 
 # RUN all commands below as 'django' user

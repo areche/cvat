@@ -1,616 +1,95 @@
 
-# Copyright (C) 2018 Intel Corporation
+# Copyright (C) 2018-2020 Intel Corporation
 #
 # SPDX-License-Identifier: MIT
 
+import itertools
 import os
 import sys
+from re import findall
 import rq
-import shlex
 import shutil
-import tempfile
-from PIL import Image
 from traceback import print_exception
-from ast import literal_eval
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 
-import mimetypes
-_SCRIPT_DIR = os.path.realpath(os.path.dirname(__file__))
-_MEDIA_MIMETYPES_FILE = os.path.join(_SCRIPT_DIR, "media.mimetypes")
-mimetypes.init(files=[_MEDIA_MIMETYPES_FILE])
-
-from cvat.apps.engine.models import StatusChoice
-from cvat.apps.engine.plugins import plugin_decorator
+from cvat.apps.engine.media_extractors import get_mime, MEDIA_TYPES, Mpeg4ChunkWriter, ZipChunkWriter, Mpeg4CompressedChunkWriter, ZipCompressedChunkWriter
+from cvat.apps.engine.models import DataChoice, StorageMethodChoice
+from cvat.apps.engine.utils import av_scan_paths
+from cvat.apps.engine.prepare import prepare_meta
 
 import django_rq
 from django.conf import settings
 from django.db import transaction
-from ffmpy import FFmpeg
-from pyunpack import Archive
 from distutils.dir_util import copy_tree
-from collections import OrderedDict
 
 from . import models
 from .log import slogger
 
 ############################# Low Level server API
 
-@transaction.atomic
-def create_empty(params):
-    """Create empty directory structure for a new task, add it to DB."""
-
-    db_task = models.Task()
-
-    db_task.name = params['task_name']
-    db_task.bug_tracker = params['bug_tracker_link']
-    db_task.path = ""
-    db_task.size = 0
-    db_task.owner = params['owner']
-    db_task.save()
-    task_path = os.path.join(settings.DATA_ROOT, str(db_task.id))
-    db_task.set_task_dirname(task_path)
-
-    task_path = db_task.get_task_dirname()
-    if os.path.isdir(task_path):
-        shutil.rmtree(task_path)
-        os.mkdir(task_path)
-
-    upload_dir = db_task.get_upload_dirname()
-    os.makedirs(upload_dir)
-    output_dir = db_task.get_data_dirname()
-    os.makedirs(output_dir)
-
-    return db_task
-
-def create(tid, params):
+def create(tid, data):
     """Schedule the task"""
     q = django_rq.get_queue('default')
-    q.enqueue_call(func=_create_thread, args=(tid, params),
-        job_id="task.create/{}".format(tid))
-
-def check(tid):
-    """Check status of the scheduled task"""
-    response = {}
-    queue = django_rq.get_queue('default')
-    job = queue.fetch_job("task.create/{}".format(tid))
-    if job is None:
-        response = {"state": "unknown"}
-    elif job.is_failed:
-        response = {"state": "error", "stderr": "Could not create the task. " + job.exc_info }
-    elif job.is_finished:
-        response = {"state": "created"}
-    else:
-        response = {"state": "started"}
-
-    if 'status' in job.meta:
-        response['status'] = job.meta['status']
-
-    return response
-
-@transaction.atomic
-def delete(tid):
-    """Delete the task"""
-    db_task = models.Task.objects.select_for_update().get(pk=tid)
-    if db_task:
-        db_task.delete()
-        shutil.rmtree(db_task.get_task_dirname(), ignore_errors=True)
-    else:
-        raise Exception("The task doesn't exist")
-
-@transaction.atomic
-def update(tid, labels):
-    """Update labels for the task"""
-
-    db_task = models.Task.objects.select_for_update().get(pk=tid)
-    db_labels = list(db_task.label_set.prefetch_related('attributespec_set').all())
-
-    new_labels = _parse_labels(labels)
-    old_labels = _parse_db_labels(db_labels)
-
-    for label_name in new_labels:
-        if label_name in old_labels:
-            db_label = [l for l in db_labels if l.name == label_name][0]
-            for attr_name in new_labels[label_name]:
-                if attr_name in old_labels[label_name]:
-                    db_attr = [attr for attr in db_label.attributespec_set.all()
-                        if attr.get_name() == attr_name][0]
-                    new_attr = new_labels[label_name][attr_name]
-                    old_attr = old_labels[label_name][attr_name]
-                    if new_attr['prefix'] != old_attr['prefix']:
-                        raise Exception("new_attr['prefix'] != old_attr['prefix']")
-                    if new_attr['type'] != old_attr['type']:
-                        raise Exception("new_attr['type'] != old_attr['type']")
-                    if set(old_attr['values']) - set(new_attr['values']):
-                        raise Exception("set(old_attr['values']) - set(new_attr['values'])")
-
-                    db_attr.text = "{}{}={}:{}".format(new_attr['prefix'],
-                        new_attr['type'], attr_name, ",".join(new_attr['values']))
-                    db_attr.save()
-                else:
-                    db_attr = models.AttributeSpec()
-                    attr = new_labels[label_name][attr_name]
-                    db_attr.text = "{}{}={}:{}".format(attr['prefix'],
-                        attr['type'], attr_name, ",".join(attr['values']))
-                    db_attr.label = db_label
-                    db_attr.save()
-        else:
-            db_label = models.Label()
-            db_label.name = label_name
-            db_label.task = db_task
-            db_label.save()
-            for attr_name in new_labels[label_name]:
-                db_attr = models.AttributeSpec()
-                attr = new_labels[label_name][attr_name]
-                db_attr.text = "{}{}={}:{}".format(attr['prefix'],
-                    attr['type'], attr_name, ",".join(attr['values']))
-                db_attr.label = db_label
-                db_attr.save()
-
-def get_frame_path(tid, frame):
-    """Read corresponding frame for the task"""
-    db_task = models.Task.objects.get(pk=tid)
-    path = _get_frame_path(frame, db_task.get_data_dirname())
-
-    return path
-
-def get(tid):
-    """Get the task as dictionary of attributes"""
-    db_task = models.Task.objects.get(pk=tid)
-    if db_task:
-        db_labels = db_task.label_set.prefetch_related('attributespec_set').order_by('-pk').all()
-        im_meta_data = get_image_meta_cache(db_task)
-        attributes = {}
-        for db_label in db_labels:
-            attributes[db_label.id] = {}
-            for db_attrspec in db_label.attributespec_set.all():
-                attributes[db_label.id][db_attrspec.id] = db_attrspec.text
-        db_segments = list(db_task.segment_set.prefetch_related('job_set').all())
-        segment_length = max(db_segments[0].stop_frame - db_segments[0].start_frame + 1, 1)
-        job_indexes = []
-        for segment in db_segments:
-            db_job = segment.job_set.first()
-            job_indexes.append({
-                "job_id": db_job.id,
-                "max_shape_id": db_job.max_shape_id,
-            })
-
-        response = {
-            "status": db_task.status,
-            "spec": {
-                "labels": OrderedDict((db_label.id, db_label.name) for db_label in db_labels),
-                "attributes": attributes
-            },
-            "size": db_task.size,
-            "taskid": db_task.id,
-            "name": db_task.name,
-            "mode": db_task.mode,
-            "segment_length": segment_length,
-            "jobs": job_indexes,
-            "overlap": db_task.overlap,
-            "z_orded": db_task.z_order,
-            "flipped": db_task.flipped,
-            "image_meta_data": im_meta_data
-        }
-    else:
-        raise Exception("Cannot find the task: {}".format(tid))
-
-    return response
-
-
-@transaction.atomic
-def save_job_status(jid, status, user):
-    db_job = models.Job.objects.select_related("segment__task").select_for_update().get(pk = jid)
-    db_task = db_job.segment.task
-    status = StatusChoice(status)
-
-    slogger.job[jid].info('changing job status from {} to {} by an user {}'.format(db_job.status, str(status), user))
-
-    db_job.status = status.value
-    db_job.save()
-    db_segments = list(db_task.segment_set.prefetch_related('job_set').all())
-    db_jobs = [db_segment.job_set.first() for db_segment in db_segments]
-
-    if len(list(filter(lambda x: StatusChoice(x.status) == StatusChoice.ANNOTATION, db_jobs))) > 0:
-        db_task.status = StatusChoice.ANNOTATION
-    elif len(list(filter(lambda x: StatusChoice(x.status) == StatusChoice.VALIDATION, db_jobs))) > 0:
-        db_task.status = StatusChoice.VALIDATION
-    else:
-        db_task.status = StatusChoice.COMPLETED
-
-    db_task.save()
-
-def get_job(jid):
-    """Get the job as dictionary of attributes"""
-    db_job = models.Job.objects.select_related("segment__task").get(id=jid)
-    if db_job:
-        db_segment = db_job.segment
-        db_task = db_segment.task
-        im_meta_data = get_image_meta_cache(db_task)
-
-        # Truncate extra image sizes
-        if db_task.mode == 'annotation':
-            im_meta_data['original_size'] = im_meta_data['original_size'][db_segment.start_frame:db_segment.stop_frame + 1]
-
-        db_labels = db_task.label_set.prefetch_related('attributespec_set').order_by('-pk').all()
-        attributes = {}
-        for db_label in db_labels:
-            attributes[db_label.id] = {}
-            for db_attrspec in db_label.attributespec_set.all():
-                attributes[db_label.id][db_attrspec.id] = db_attrspec.text
-
-        response = {
-            "status": db_job.status,
-            "labels": OrderedDict((db_label.id, db_label.name) for db_label in db_labels),
-            "stop": db_segment.stop_frame,
-            "taskid": db_task.id,
-            "slug": db_task.name,
-            "jobid": jid,
-            "start": db_segment.start_frame,
-            "mode": db_task.mode,
-            "overlap": db_task.overlap,
-            "attributes": attributes,
-            "z_order": db_task.z_order,
-            "flipped": db_task.flipped,
-            "image_meta_data": im_meta_data,
-            "max_shape_id": db_job.max_shape_id,
-        }
-    else:
-        raise Exception("Cannot find the job: {}".format(jid))
-
-    return response
+    q.enqueue_call(func=_create_thread, args=(tid, data),
+        job_id="/api/v1/tasks/{}".format(tid))
 
 @transaction.atomic
 def rq_handler(job, exc_type, exc_value, traceback):
-    tid = job.id.split('/')[1]
-    db_task = models.Task.objects.select_for_update().get(pk=tid)
-    with open(db_task.get_log_path(), "wt") as log_file:
-        print_exception(exc_type, exc_value, traceback, file=log_file)
-    db_task.delete()
+    splitted = job.id.split('/')
+    tid = int(splitted[splitted.index('tasks') + 1])
+    try:
+        db_task = models.Task.objects.select_for_update().get(pk=tid)
+        with open(db_task.get_log_path(), "wt") as log_file:
+            print_exception(exc_type, exc_value, traceback, file=log_file)
+    except models.Task.DoesNotExist:
+        pass # skip exceptions in the code
 
     return False
 
 ############################# Internal implementation for server API
 
-class _FrameExtractor:
-    def __init__(self, source_path, compress_quality, flip_flag=False):
-        # translate inversed range 1:95 to 2:32
-        translated_quality = 96 - compress_quality
-        translated_quality = round((((translated_quality - 1) * (31 - 2)) / (95 - 1)) + 2)
-        self.output = tempfile.mkdtemp(prefix='cvat-', suffix='.data')
-        target_path = os.path.join(self.output, '%d.jpg')
-        output_opts = '-start_number 0 -b:v 10000k -vsync 0 -an -y -q:v ' + str(translated_quality)
-        if flip_flag:
-            output_opts += ' -vf "transpose=2,transpose=2"'
-        ff = FFmpeg(
-            inputs  = {source_path: None},
-            outputs = {target_path: output_opts})
-        ff.run()
+def _copy_data_from_share(server_files, upload_dir):
+    job = rq.get_current_job()
+    job.meta['status'] = 'Data are being copied from share..'
+    job.save_meta()
 
-    def getframepath(self, k):
-        return "{0}/{1}.jpg".format(self.output, k)
-
-    def __del__(self):
-        if self.output:
-            shutil.rmtree(self.output)
-
-    def __getitem__(self, k):
-        return self.getframepath(k)
-
-    def __iter__(self):
-        i = 0
-        while os.path.exists(self.getframepath(i)):
-            yield self[i]
-            i += 1
-
-def _make_image_meta_cache(db_task):
-    with open(db_task.get_image_meta_cache_path(), 'w') as meta_file:
-        cache = {
-            'original_size': []
-        }
-
-        if db_task.mode == 'interpolation':
-            image = Image.open(get_frame_path(db_task.id, 0))
-            cache['original_size'].append({
-                'width': image.size[0],
-                'height': image.size[1]
-            })
-            image.close()
+    for path in server_files:
+        source_path = os.path.join(settings.SHARE_ROOT, os.path.normpath(path))
+        target_path = os.path.join(upload_dir, path)
+        if os.path.isdir(source_path):
+            copy_tree(source_path, target_path)
         else:
-            filenames = []
-            for root, _, files in os.walk(db_task.get_upload_dirname()):
-                fullnames = map(lambda f: os.path.join(root, f), files)
-                images = filter(lambda x: _get_mime(x) == 'image', fullnames)
-                filenames.extend(images)
-            filenames.sort()
+            target_dir = os.path.dirname(target_path)
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+            shutil.copyfile(source_path, target_path)
 
-            for image_path in filenames:
-                image = Image.open(image_path)
-                cache['original_size'].append({
-                    'width': image.size[0],
-                    'height': image.size[1]
-                })
-                image.close()
+def _save_task_to_db(db_task):
+    job = rq.get_current_job()
+    job.meta['status'] = 'Task is being saved in database'
+    job.save_meta()
 
-        meta_file.write(str(cache))
+    segment_size = db_task.segment_size
+    segment_step = segment_size
+    if segment_size == 0:
+        segment_size = db_task.data.size
 
+        # Segment step must be more than segment_size + overlap in single-segment tasks
+        # Otherwise a task contains an extra segment
+        segment_step = sys.maxsize
 
-def get_image_meta_cache(db_task):
-    try:
-        with open(db_task.get_image_meta_cache_path()) as meta_cache_file:
-            return literal_eval(meta_cache_file.read())
-    except Exception:
-        _make_image_meta_cache(db_task)
-        with open(db_task.get_image_meta_cache_path()) as meta_cache_file:
-            return literal_eval(meta_cache_file.read())
+    default_overlap = 5 if db_task.mode == 'interpolation' else 0
+    if db_task.overlap is None:
+        db_task.overlap = default_overlap
+    db_task.overlap = min(db_task.overlap, segment_size  // 2)
 
+    segment_step -= db_task.overlap
 
-def _get_mime(name):
-    mime = mimetypes.guess_type(name)
-    mime_type = mime[0]
-    encoding = mime[1]
-    # zip, rar, tar, tar.gz, tar.bz2, 7z, cpio
-    supportedArchives = ['application/zip', 'application/x-rar-compressed',
-        'application/x-tar', 'application/x-7z-compressed', 'application/x-cpio',
-        'gzip', 'bzip2']
-    if mime_type is not None:
-        if mime_type.startswith('video'):
-            return 'video'
-        elif mime_type in supportedArchives or encoding in supportedArchives:
-            return 'archive'
-        elif mime_type.startswith('image'):
-            return 'image'
-        else:
-            return 'empty'
-    else:
-        if os.path.isdir(name):
-            return 'directory'
-        else:
-            return 'empty'
+    for start_frame in range(0, db_task.data.size, segment_step):
+        stop_frame = min(start_frame + segment_size - 1, db_task.data.size - 1)
 
-
-def _get_frame_path(frame, base_dir):
-    d1 = str(frame // 10000)
-    d2 = str(frame // 100)
-    path = os.path.join(d1, d2, str(frame) + '.jpg')
-    if base_dir:
-        path = os.path.join(base_dir, path)
-
-    return path
-
-def _parse_labels(labels):
-    parsed_labels = OrderedDict()
-
-    last_label = ""
-    for token in shlex.split(labels):
-        if token[0] != "~" and token[0] != "@":
-            if token in parsed_labels:
-                raise ValueError("labels string is not corect. " +
-                    "`{}` label is specified at least twice.".format(token))
-
-            parsed_labels[token] = {}
-            last_label = token
-        else:
-            attr = models.parse_attribute(token)
-            attr['text'] = token
-            if not attr['type'] in ['checkbox', 'radio', 'number', 'text', 'select']:
-                raise ValueError("labels string is not corect. " +
-                    "`{}` attribute has incorrect type {}.".format(
-                    attr['name'], attr['type']))
-
-            values = attr['values']
-            if attr['type'] == 'checkbox': # <prefix>checkbox=name:true/false
-                if not (len(values) == 1 and values[0] in ['true', 'false']):
-                    raise ValueError("labels string is not corect. " +
-                        "`{}` attribute has incorrect value.".format(attr['name']))
-            elif attr['type'] == 'number': # <prefix>number=name:min,max,step
-                try:
-                    if len(values) != 3 or float(values[2]) <= 0 or \
-                        float(values[0]) >= float(values[1]):
-                        raise ValueError
-                except ValueError:
-                    raise ValueError("labels string is not correct. " +
-                        "`{}` attribute has incorrect format.".format(attr['name']))
-
-            if attr['name'] in parsed_labels[last_label]:
-                raise ValueError("labels string is not corect. " +
-                    "`{}` attribute is specified at least twice.".format(attr['name']))
-
-            parsed_labels[last_label][attr['name']] = attr
-
-    return parsed_labels
-
-def _parse_db_labels(db_labels):
-    result = []
-    for db_label in db_labels:
-        result += [db_label.name]
-        result += [attr.text for attr in db_label.attributespec_set.all()]
-    return _parse_labels(" ".join(result))
-
-
-'''
-    Count all files, remove garbage (unknown mime types or extra dirs)
-'''
-def _prepare_paths(source_paths, target_paths, storage):
-    counters = {
-        "image": 0,
-        "directory": 0,
-        "video": 0,
-        "archive": 0
-    }
-
-    share_dirs_mapping = {}
-    share_files_mapping = {}
-
-    if storage == 'local':
-        # Files were uploaded early. Remove trash if it exists. Count them.
-        for path in target_paths:
-            mime = _get_mime(path)
-            if mime in ['video', 'archive', 'image']:
-                counters[mime] += 1
-            else:
-                try:
-                    os.remove(path)
-                except:
-                    os.rmdir(path)
-    else:
-        # Files are available via mount share. Count them and separate dirs.
-        for source_path, target_path in zip(source_paths, target_paths):
-            mime = _get_mime(source_path)
-            if mime in ['directory', 'image', 'video', 'archive']:
-                counters[mime] += 1
-                if mime == 'directory':
-                    share_dirs_mapping[source_path] = target_path
-                else:
-                    share_files_mapping[source_path] = target_path
-
-        # Remove directories if other files from them exists in input paths
-        exclude = []
-        for dir_name in share_dirs_mapping.keys():
-            for patch in share_files_mapping.keys():
-                if dir_name in patch:
-                    exclude.append(dir_name)
-                    break
-
-        for excluded_dir in exclude:
-            del share_dirs_mapping[excluded_dir]
-
-        counters['directory'] = len(share_dirs_mapping.keys())
-
-    return (counters, share_dirs_mapping, share_files_mapping)
-
-
-'''
-    Check file set on valid
-    Valid if:
-        1 video, 0 images and 0 dirs (interpolation mode)
-        1 archive, 0 images and 0 dirs (annotation mode)
-        Many images or many dirs with images (annotation mode), 0 archives and 0 videos
-'''
-def _valid_file_set(counters):
-    if (counters['image'] or counters['directory']) and (counters['video'] or counters['archive']):
-        return False
-    elif counters['video'] > 1 or (counters['video'] and (counters['archive'] or counters['image'] or counters['directory'])):
-        return False
-    elif counters['archive'] > 1 or (counters['archive'] and (counters['video'] or counters['image'] or counters['directory'])):
-        return False
-
-    return True
-
-
-'''
-    Copy data from share to local
-'''
-def _copy_data_from_share(share_files_mapping, share_dirs_mapping):
-    for source_path in share_dirs_mapping:
-        copy_tree(source_path, share_dirs_mapping[source_path])
-    for source_path in share_files_mapping:
-        target_path = share_files_mapping[source_path]
-        target_dir = os.path.dirname(target_path)
-        if not os.path.exists(target_dir):
-            os.makedirs(target_dir)
-        shutil.copyfile(source_path, target_path)
-
-
-'''
-    Find and unpack archive in upload dir
-'''
-def _find_and_unpack_archive(upload_dir):
-    archive = None
-    for root, _, files in os.walk(upload_dir):
-        fullnames = map(lambda f: os.path.join(root, f), files)
-        archives = list(filter(lambda x: _get_mime(x) == 'archive', fullnames))
-        if len(archives):
-            archive = archives[0]
-            break
-    if archive:
-        Archive(archive).extractall(upload_dir)
-        os.remove(archive)
-    else:
-        raise Exception('Type defined as archive, but archives were not found.')
-
-    return archive
-
-
-'''
-    Search a video in upload dir and split it by frames. Copy frames to target dirs
-'''
-def _find_and_extract_video(upload_dir, output_dir, db_task, compress_quality, flip_flag, job):
-    video = None
-    for root, _, files in os.walk(upload_dir):
-        fullnames = map(lambda f: os.path.join(root, f), files)
-        videos = list(filter(lambda x: _get_mime(x) == 'video', fullnames))
-        if len(videos):
-            video = videos[0]
-            break
-
-    if video:
-        job.meta['status'] = 'Video is being extracted..'
-        job.save_meta()
-        extractor = _FrameExtractor(video, compress_quality, flip_flag)
-        for frame, image_orig_path in enumerate(extractor):
-            image_dest_path = _get_frame_path(frame, output_dir)
-            db_task.size += 1
-            dirname = os.path.dirname(image_dest_path)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
-            shutil.copyfile(image_orig_path, image_dest_path)
-    else:
-        raise Exception("Video files were not found")
-
-    return video
-
-
-'''
-    Recursive search for all images in upload dir and compress it to RGB jpg with specified quality. Create symlinks for them.
-'''
-def _find_and_compress_images(upload_dir, output_dir, db_task, compress_quality, flip_flag, job):
-    filenames = []
-    for root, _, files in os.walk(upload_dir):
-        fullnames = map(lambda f: os.path.join(root, f), files)
-        images = filter(lambda x: _get_mime(x) == 'image', fullnames)
-        filenames.extend(images)
-    filenames.sort()
-
-    if len(filenames):
-        for idx, name in enumerate(filenames):
-            job.meta['status'] = 'Images are being compressed.. {}%'.format(idx * 100 // len(filenames))
-            job.save_meta()
-            compressed_name = os.path.splitext(name)[0] + '.jpg'
-            image = Image.open(name).convert('RGB')
-            if flip_flag:
-                image = image.transpose(Image.ROTATE_180)
-            image.save(compressed_name, quality=compress_quality, optimize=True)
-            image.close()
-            if compressed_name != name:
-                os.remove(name)
-                # PIL::save uses filename in order to define image extension.
-                # We need save it as jpeg for compression and after rename the file
-                # Else annotation file will contain invalid file names (with other extensions)
-                os.rename(compressed_name, name)
-
-        for frame, image_orig_path in enumerate(filenames):
-            image_dest_path = _get_frame_path(frame, output_dir)
-            image_orig_path = os.path.abspath(image_orig_path)
-            db_task.size += 1
-            dirname = os.path.dirname(image_dest_path)
-            if not os.path.exists(dirname):
-                os.makedirs(dirname)
-            os.symlink(image_orig_path, image_dest_path)
-    else:
-        raise Exception("Image files were not found")
-
-    return filenames
-
-def _save_task_to_db(db_task, task_params):
-    db_task.overlap = min(db_task.size, task_params['overlap'])
-    db_task.mode = task_params['mode']
-    db_task.z_order = task_params['z_order']
-    db_task.flipped = task_params['flip']
-    db_task.source = task_params['data']
-
-    segment_step = task_params['segment'] - db_task.overlap
-    for x in range(0, db_task.size, segment_step):
-        start_frame = x
-        stop_frame = min(x + task_params['segment'] - 1, db_task.size - 1)
         slogger.glob.info("New segment for task #{}: start_frame = {}, \
             stop_frame = {}".format(db_task.id, start_frame, stop_frame))
 
@@ -624,87 +103,311 @@ def _save_task_to_db(db_task, task_params):
         db_job.segment = db_segment
         db_job.save()
 
-    parsed_labels = _parse_labels(task_params['labels'])
-    for label in parsed_labels:
-        db_label = models.Label()
-        db_label.task = db_task
-        db_label.name = label
-        db_label.save()
-
-        for attr in parsed_labels[label]:
-            db_attrspec = models.AttributeSpec()
-            db_attrspec.label = db_label
-            db_attrspec.text = parsed_labels[label][attr]['text']
-            db_attrspec.save()
-
+    db_task.data.save()
     db_task.save()
 
+def _count_files(data, meta_info_file=None):
+    share_root = settings.SHARE_ROOT
+    server_files = []
 
-@plugin_decorator
-@transaction.atomic
-def _create_thread(tid, params):
-    slogger.glob.info("create task #{}".format(tid))
-    job = rq.get_current_job()
+    for path in data["server_files"]:
+        path = os.path.normpath(path).lstrip('/')
+        if '..' in path.split(os.path.sep):
+            raise ValueError("Don't use '..' inside file paths")
+        full_path = os.path.abspath(os.path.join(share_root, path))
+        if os.path.commonprefix([share_root, full_path]) != share_root:
+            raise ValueError("Bad file path: " + path)
+        server_files.append(path)
 
-    db_task = models.Task.objects.select_for_update().get(pk=tid)
-    upload_dir = db_task.get_upload_dirname()
-    output_dir = db_task.get_data_dirname()
+    server_files.sort(reverse=True)
+    # The idea of the code is trivial. After sort we will have files in the
+    # following order: 'a/b/c/d/2.txt', 'a/b/c/d/1.txt', 'a/b/c/d', 'a/b/c'
+    # Let's keep all items which aren't substrings of the previous item. In
+    # the example above only 2.txt and 1.txt files will be in the final list.
+    # Also need to correctly handle 'a/b/c0', 'a/b/c' case.
+    data['server_files'] = [v[1] for v in zip([""] + server_files, server_files)
+        if not os.path.dirname(v[0]).startswith(v[1])]
 
-    counters, share_dirs_mapping, share_files_mapping = _prepare_paths(
-        params['SOURCE_PATHS'],
-        params['TARGET_PATHS'],
-        params['storage']
+    def count_files(file_mapping, counter):
+        for rel_path, full_path in file_mapping.items():
+            mime = get_mime(full_path)
+            if mime in counter:
+                counter[mime].append(rel_path)
+            elif findall('meta_info.txt$', rel_path):
+                meta_info_file.append(rel_path)
+            else:
+                slogger.glob.warn("Skip '{}' file (its mime type doesn't "
+                    "correspond to a video or an image file)".format(full_path))
+
+    counter = { media_type: [] for media_type in MEDIA_TYPES.keys() }
+
+    count_files(
+        file_mapping={ f:f for f in data['remote_files'] or data['client_files']},
+        counter=counter,
     )
 
-    if (not _valid_file_set(counters)):
-        raise Exception('Only one archive, one video or many images can be dowloaded simultaneously. \
-            {} image(s), {} dir(s), {} video(s), {} archive(s) found'.format(
-                counters['image'],
-                counters['directory'],
-                counters['video'],
-                counters['archive']
-            )
-        )
+    count_files(
+        file_mapping={ f:os.path.abspath(os.path.join(share_root, f)) for f in data['server_files']},
+        counter=counter,
+    )
 
-    if params['storage'] == 'share':
-        job.meta['status'] = 'Data are being copied from share..'
+    return counter
+
+def _validate_data(counter, meta_info_file=None):
+    unique_entries = 0
+    multiple_entries = 0
+    for media_type, media_config in MEDIA_TYPES.items():
+        if counter[media_type]:
+            if media_config['unique']:
+                unique_entries += len(counter[media_type])
+            else:
+                multiple_entries += len(counter[media_type])
+
+            if meta_info_file and media_type != 'video':
+                raise Exception('File with meta information can only be uploaded with video file')
+
+    if unique_entries == 1 and multiple_entries > 0 or unique_entries > 1:
+        unique_types = ', '.join([k for k, v in MEDIA_TYPES.items() if v['unique']])
+        multiply_types = ', '.join([k for k, v in MEDIA_TYPES.items() if not v['unique']])
+        count = ', '.join(['{} {}(s)'.format(len(v), k) for k, v in counter.items()])
+        raise ValueError('Only one {} or many {} can be used simultaneously, \
+            but {} found.'.format(unique_types, multiply_types, count))
+
+    if unique_entries == 0 and multiple_entries == 0:
+        raise ValueError('No media data found')
+
+    task_modes = [MEDIA_TYPES[media_type]['mode'] for media_type, media_files in counter.items() if media_files]
+
+    if not all(mode == task_modes[0] for mode in task_modes):
+        raise Exception('Could not combine different task modes for data')
+
+    return counter, task_modes[0]
+
+def _download_data(urls, upload_dir):
+    job = rq.get_current_job()
+    local_files = {}
+    for url in urls:
+        name = os.path.basename(urlrequest.url2pathname(urlparse.urlparse(url).path))
+        if name in local_files:
+            raise Exception("filename collision: {}".format(name))
+        slogger.glob.info("Downloading: {}".format(url))
+        job.meta['status'] = '{} is being downloaded..'.format(url)
         job.save_meta()
-        _copy_data_from_share(share_files_mapping, share_dirs_mapping)
 
-    archive = None
-    if counters['archive']:
-        job.meta['status'] = 'Archive is being unpacked..'
-        job.save_meta()
-        archive = _find_and_unpack_archive(upload_dir)
+        req = urlrequest.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        try:
+            with urlrequest.urlopen(req) as fp, open(os.path.join(upload_dir, name), 'wb') as tfp:
+                while True:
+                    block = fp.read(8192)
+                    if not block:
+                        break
+                    tfp.write(block)
+        except urlerror.HTTPError as err:
+            raise Exception("Failed to download " + url + ". " + str(err.code) + ' - ' + err.reason)
+        except urlerror.URLError as err:
+            raise Exception("Invalid URL: " + url + ". " + err.reason)
 
-    # Define task mode and other parameters
-    task_params = {
-        'mode': 'annotation' if counters['image'] or counters['directory'] or counters['archive'] else 'interpolation',
-        'flip': params['flip_flag'].lower() == 'true',
-        'z_order': params['z_order'].lower() == 'true',
-        'compress': int(params.get('compress_quality', 50)),
-        'segment': int(params.get('segment_size', sys.maxsize)),
-        'labels': params['labels'],
-    }
-    task_params['overlap'] = int(params.get('overlap_size', 5 if task_params['mode'] == 'interpolation' else 0))
-    task_params['overlap'] = min(task_params['overlap'], task_params['segment'] - 1)
-    slogger.glob.info("Task #{} parameters: {}".format(tid, task_params))
+        local_files[name] = True
+    return list(local_files.keys())
 
-    if task_params['mode'] == 'interpolation':
-        video = _find_and_extract_video(upload_dir, output_dir, db_task,
-            task_params['compress'], task_params['flip'], job)
-        task_params['data'] = os.path.relpath(video, upload_dir)
-    else:
-        files =_find_and_compress_images(upload_dir, output_dir, db_task,
-            task_params['compress'], task_params['flip'], job)
-        if archive:
-            task_params['data'] = os.path.relpath(archive, upload_dir)
-        else:
-            task_params['data'] = '{} images: {}, ...'.format(len(files),
-                ", ".join([os.path.relpath(x, upload_dir) for x in files[0:2]]))
+@transaction.atomic
+def _create_thread(tid, data):
+    slogger.glob.info("create task #{}".format(tid))
 
-    slogger.glob.info("Founded frames {} for task #{}".format(db_task.size, tid))
+    db_task = models.Task.objects.select_for_update().get(pk=tid)
+    db_data = db_task.data
+    if db_task.data.size != 0:
+        raise NotImplementedError("Adding more data is not implemented")
 
-    job.meta['status'] = 'Task is being saved in database'
+    upload_dir = db_data.get_upload_dirname()
+
+    if data['remote_files']:
+        data['remote_files'] = _download_data(data['remote_files'], upload_dir)
+
+    meta_info_file = []
+    media = _count_files(data, meta_info_file)
+    media, task_mode = _validate_data(media, meta_info_file)
+    if meta_info_file:
+        assert settings.USE_CACHE and db_data.storage_method == StorageMethodChoice.CACHE, \
+            "File with meta information can be uploaded if 'Use cache' option is also selected"
+
+    if data['server_files']:
+        _copy_data_from_share(data['server_files'], upload_dir)
+
+    av_scan_paths(upload_dir)
+
+    job = rq.get_current_job()
+    job.meta['status'] = 'Media files are being extracted...'
     job.save_meta()
-    _save_task_to_db(db_task, task_params)
+
+    db_images = []
+    extractor = None
+
+    for media_type, media_files in media.items():
+        if media_files:
+            if extractor is not None:
+                raise Exception('Combined data types are not supported')
+            extractor = MEDIA_TYPES[media_type]['extractor'](
+                source_path=[os.path.join(upload_dir, f) for f in media_files],
+                step=db_data.get_frame_step(),
+                start=db_data.start_frame,
+                stop=data['stop_frame'],
+            )
+    if extractor.__class__ == MEDIA_TYPES['zip']['extractor']:
+        extractor.extract()
+    db_task.mode = task_mode
+    db_data.compressed_chunk_type = models.DataChoice.VIDEO if task_mode == 'interpolation' and not data['use_zip_chunks'] else models.DataChoice.IMAGESET
+    db_data.original_chunk_type = models.DataChoice.VIDEO if task_mode == 'interpolation' else models.DataChoice.IMAGESET
+
+    def update_progress(progress):
+        progress_animation = '|/-\\'
+        if not hasattr(update_progress, 'call_counter'):
+            update_progress.call_counter = 0
+
+        status_template = 'Images are being compressed {}'
+        if progress:
+            current_progress = '{}%'.format(round(progress * 100))
+        else:
+            current_progress = '{}'.format(progress_animation[update_progress.call_counter])
+        job.meta['status'] = status_template.format(current_progress)
+        job.save_meta()
+        update_progress.call_counter = (update_progress.call_counter + 1) % len(progress_animation)
+
+    compressed_chunk_writer_class = Mpeg4CompressedChunkWriter if db_data.compressed_chunk_type == DataChoice.VIDEO else ZipCompressedChunkWriter
+    original_chunk_writer_class = Mpeg4ChunkWriter if db_data.original_chunk_type == DataChoice.VIDEO else ZipChunkWriter
+
+    compressed_chunk_writer = compressed_chunk_writer_class(db_data.image_quality)
+    original_chunk_writer = original_chunk_writer_class(100)
+
+    # calculate chunk size if it isn't specified
+    if db_data.chunk_size is None:
+        if isinstance(compressed_chunk_writer, ZipCompressedChunkWriter):
+            w, h = extractor.get_image_size(0)
+            area = h * w
+            db_data.chunk_size = max(2, min(72, 36 * 1920 * 1080 // area))
+        else:
+            db_data.chunk_size = 36
+
+
+    video_path = ""
+    video_size = (0, 0)
+
+    if settings.USE_CACHE and db_data.storage_method == StorageMethodChoice.CACHE:
+       for media_type, media_files in media.items():
+
+            if not media_files:
+                continue
+
+            if task_mode == MEDIA_TYPES['video']['mode']:
+                try:
+                    if meta_info_file:
+                        try:
+                            from cvat.apps.engine.prepare import UploadedMeta
+                            if os.path.split(meta_info_file[0])[0]:
+                                os.replace(
+                                    os.path.join(upload_dir, meta_info_file[0]),
+                                    db_data.get_meta_path()
+                                )
+                            meta_info = UploadedMeta(source_path=os.path.join(upload_dir, media_files[0]),
+                                                     meta_path=db_data.get_meta_path())
+                            meta_info.check_seek_key_frames()
+                            meta_info.check_frames_numbers()
+                            meta_info.save_meta_info()
+                            assert len(meta_info.key_frames) > 0, 'No key frames.'
+                        except Exception as ex:
+                            base_msg = str(ex) if isinstance(ex, AssertionError) else \
+                                'Invalid meta information was upload.'
+                            job.meta['status'] = '{} Start prepare valid meta information.'.format(base_msg)
+                            job.save_meta()
+                            meta_info, smooth_decoding = prepare_meta(
+                                media_file=media_files[0],
+                                upload_dir=upload_dir,
+                                chunk_size=db_data.chunk_size
+                            )
+                            assert smooth_decoding == True, 'Too few keyframes for smooth video decoding.'
+                    else:
+                        meta_info, smooth_decoding = prepare_meta(
+                            media_file=media_files[0],
+                            upload_dir=upload_dir,
+                            chunk_size=db_data.chunk_size
+                        )
+                        assert smooth_decoding == True, 'Too few keyframes for smooth video decoding.'
+
+                    all_frames = meta_info.get_task_size()
+                    video_size = meta_info.frame_sizes
+
+                    db_data.size = len(range(db_data.start_frame, min(data['stop_frame'] + 1 if data['stop_frame'] else all_frames, all_frames), db_data.get_frame_step()))
+                    video_path = os.path.join(upload_dir, media_files[0])
+                except Exception as ex:
+                    db_data.storage_method = StorageMethodChoice.FILE_SYSTEM
+                    if os.path.exists(db_data.get_meta_path()):
+                        os.remove(db_data.get_meta_path())
+                    base_msg = str(ex) if isinstance(ex, AssertionError) else "Uploaded video does not support a quick way of task creating."
+                    job.meta['status'] = "{} The task will be created using the old method".format(base_msg)
+                    job.save_meta()
+            else:#images,archive
+                db_data.size = len(extractor)
+
+                counter = itertools.count()
+                for chunk_number, chunk_frames in itertools.groupby(extractor.frame_range, lambda x: next(counter) // db_data.chunk_size):
+                    chunk_paths = [(extractor.get_path(i), i) for i in chunk_frames]
+                    img_sizes = []
+                    with open(db_data.get_dummy_chunk_path(chunk_number), 'w') as dummy_chunk:
+                        for path, frame_id in chunk_paths:
+                            dummy_chunk.write(path + '\n')
+                            img_sizes.append(extractor.get_image_size(frame_id))
+
+                    db_images.extend([
+                        models.Image(data=db_data,
+                            path=os.path.relpath(path, upload_dir),
+                            frame=frame, width=w, height=h)
+                        for (path, frame), (w, h) in zip(chunk_paths, img_sizes)
+                    ])
+
+    if db_data.storage_method == StorageMethodChoice.FILE_SYSTEM or not settings.USE_CACHE:
+        counter = itertools.count()
+        generator = itertools.groupby(extractor, lambda x: next(counter) // db_data.chunk_size)
+        for chunk_idx, chunk_data in generator:
+            chunk_data = list(chunk_data)
+            original_chunk_path = db_data.get_original_chunk_path(chunk_idx)
+            original_chunk_writer.save_as_chunk(chunk_data, original_chunk_path)
+
+            compressed_chunk_path = db_data.get_compressed_chunk_path(chunk_idx)
+            img_sizes = compressed_chunk_writer.save_as_chunk(chunk_data, compressed_chunk_path)
+
+            if db_task.mode == 'annotation':
+                db_images.extend([
+                    models.Image(
+                        data=db_data,
+                        path=os.path.relpath(data[1], upload_dir),
+                        frame=data[2],
+                        width=size[0],
+                        height=size[1])
+
+                    for data, size in zip(chunk_data, img_sizes)
+                ])
+            else:
+                video_size = img_sizes[0]
+                video_path = chunk_data[0][1]
+
+            db_data.size += len(chunk_data)
+            progress = extractor.get_progress(chunk_data[-1][2])
+            update_progress(progress)
+
+    if db_task.mode == 'annotation':
+        models.Image.objects.bulk_create(db_images)
+        db_images = []
+    else:
+        models.Video.objects.create(
+            data=db_data,
+            path=os.path.relpath(video_path, upload_dir),
+            width=video_size[0], height=video_size[1])
+
+    if db_data.stop_frame == 0:
+        db_data.stop_frame = db_data.start_frame + (db_data.size - 1) * db_data.get_frame_step()
+
+    preview = extractor.get_preview()
+    preview.save(db_data.get_preview_path())
+
+    slogger.glob.info("Found frames {} for Data #{}".format(db_data.size, db_data.id))
+    _save_task_to_db(db_task)
